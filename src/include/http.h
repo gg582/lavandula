@@ -113,6 +113,8 @@ typedef struct {
     char          *content;
     HttpStatusCode status;
     char          *contentType;
+    Header        *headers;
+    size_t         headerCount;
 } HttpResponse;
 
 typedef struct {

@@ -27,6 +27,18 @@ DbContext *createSqlLite3DbContext(char *dbPath) {
     return context;
 }
 
+DbContext *createPostgresDbContext(char *connString) {
+    fprintf(stderr, "PostgreSQL integration not yet implemented.\n");
+    (void)connString; // Suppress unused parameter warning
+    return NULL;
+}
+
+DbContext *createMysqlDbContext(char *connString) {
+    fprintf(stderr, "MySQL integration not yet implemented.\n");
+    (void)connString; // Suppress unused parameter warning
+    return NULL;
+}
+
 bool dbExec(DbContext *db, const char *query, const DbParam *params, int paramCount) {
     sqlite3_stmt *stmt;
 
@@ -158,9 +170,19 @@ DbResult *dbQueryRows(DbContext *db, const char *query, DbParam *params, int par
 }
 
 bool dbClose(DbContext *db) {
-    if (db->type == SQLITE) {
-        sqlite3_close((sqlite3 *)db->connection);
-    }
+    if (!db) return false;
 
+    switch (db->type) {
+        case SQLITE:
+            sqlite3_close((sqlite3 *)db->connection);
+            break;
+        case POSTGRES:
+            fprintf(stderr, "Closing PostgreSQL connection not yet implemented.\n");
+            break;
+        case MYSQL:
+            fprintf(stderr, "Closing MySQL connection not yet implemented.\n");
+            break;
+    }
+    free(db);
     return true;
 }

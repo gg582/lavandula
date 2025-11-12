@@ -147,6 +147,7 @@ void cleanupApp(App *app) {
     freeServer(&app->server);
     dotenvClean();
     free(app->middleware.handlers);
+    freeCorsPolicy(app->corsPolicy);
 
     if (!app->dbContext) return;
     if (app->dbContext->type == SQLITE) {

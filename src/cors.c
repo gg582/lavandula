@@ -61,6 +61,15 @@ void allowAnyMethod(CorsConfig *const config) {
     }
 }
 
+bool isOriginAllowed(const CorsConfig *const config, const char *const origin) {
+    for (int i = 0; i < config->allowOriginCount; i++) {
+        if (strcmp(config->allowOrigin[i], "*") == 0 || strcmp(config->allowOrigin[i], origin) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void allowHeader(CorsConfig *const config, const char *const header) {
     if (config->headerCount >= HEADER_LIMIT) {
         return;

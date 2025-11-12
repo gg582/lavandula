@@ -49,6 +49,8 @@ typedef struct {
 
 typedef enum {
     SQLITE,
+    POSTGRES,
+    MYSQL,
 } SqlDbType;
 
 typedef struct {
@@ -59,6 +61,8 @@ typedef struct {
 } DbContext;
 
 DbContext *createSqlLite3DbContext(char *dbPath);
+DbContext *createPostgresDbContext(char *connString);
+DbContext *createMysqlDbContext(char *connString);
 
 bool dbExec(DbContext *db, const char *query, const DbParam *params, int paramCount);
 DbResult *dbQueryRows(DbContext *db, const char *query, DbParam *params, int paramCount);

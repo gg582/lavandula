@@ -42,7 +42,9 @@ HttpResponse defaultNotFoundController(RequestContext context) {
     (void)context;
     return (HttpResponse) {
         .content = "Not Found",
-        .status = HTTP_NOT_FOUND
+        .status = HTTP_NOT_FOUND,
+        .headers = NULL,
+        .headerCount = 0
     };
 }
 
@@ -50,7 +52,9 @@ HttpResponse defaultMethodNotAllowedController(RequestContext context) {
     (void)context;
     return (HttpResponse) {
         .content = "Method Not Allowed",
-        .status = HTTP_METHOD_NOT_ALLOWED
+        .status = HTTP_METHOD_NOT_ALLOWED,
+        .headers = NULL,
+        .headerCount = 0
     };
 }
 
@@ -75,6 +79,83 @@ void freeServer(Server *server) {
     freeRouter(&server->router);
 }
 
+void addHeaderToResponse(HttpResponse *response, const char *name, const char *value) {
+    if (!response) return;
+
+    Header *newHeaders = realloc(response->headers, (response->headerCount + 1) * sizeof(Header));
+    if (!newHeaders) {
+        fprintf(stderr, "Fatal: out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+    response->headers = newHeaders;
+
+    strncpy(response->headers[response->headerCount].name, name, MAX_HEADER_NAME - 1);
+    response->headers[response->headerCount].name[MAX_HEADER_NAME - 1] = '\0';
+    strncpy(response->headers[response->headerCount].value, value, MAX_HEADER_VALUE - 1);
+    response->headers[response->headerCount].value[MAX_HEADER_VALUE - 1] = '\0';
+
+    response->headerCount++;
+}
+
+void freeHttpResponse(HttpResponse *response) {
+    if (!response) return;
+
+    free(response->content);
+    for (size_t i = 0; i < response->headerCount; i++) {
+        // If header names/values were dynamically allocated, free them here.
+        // Currently, they are fixed-size arrays within the Header struct, so no individual free needed.
+    }
+    free(response->headers);
+    response->headers = NULL;
+    response->headerCount = 0;
+}
+
+void applyCorsHeaders(const CorsConfig *config, const HttpRequest *request, HttpResponse *response) {
+    char origin[MAX_HEADER_VALUE] = {0};
+    char requestMethod[MAX_HEADER_VALUE] = {0};
+    char requestHeaders[MAX_HEADER_VALUE] = {0};
+
+    for (size_t i = 0; i < request->headerCount; i++) {
+        if (strcasecmp(request->headers[i].name, "Origin") == 0) {
+            strncpy(origin, request->headers[i].value, sizeof(origin) - 1);
+        } else if (strcasecmp(request->headers[i].name, "Access-Control-Request-Method") == 0) {
+            strncpy(requestMethod, request->headers[i].value, sizeof(requestMethod) - 1);
+        } else if (strcasecmp(request->headers[i].name, "Access-Control-Request-Headers") == 0) {
+            strncpy(requestHeaders, request->headers[i].value, sizeof(requestHeaders) - 1);
+        }
+    }
+
+    if (strlen(origin) > 0 && isOriginAllowed(config, origin)) {
+        addHeaderToResponse(response, "Access-Control-Allow-Origin", origin);
+
+        if (request->method == HTTP_OPTIONS) {
+            // Preflight request
+            char allowedMethods[256] = {0};
+            for (int i = 0; i < config->methodCount; i++) {
+                strcat(allowedMethods, httpMethodToStr(config->allowMethods[i]));
+                if (i < config->methodCount - 1) {
+                    strcat(allowedMethods, ", ");
+                }
+            }
+            addHeaderToResponse(response, "Access-Control-Allow-Methods", allowedMethods);
+
+            char allowedHeaders[512] = {0};
+            for (int i = 0; i < config->headerCount; i++) {
+                strcat(allowedHeaders, config->allowHeaders[i]);
+                if (i < config->headerCount - 1) {
+                    strcat(allowedHeaders, ", ");
+                }
+            }
+            if (strlen(allowedHeaders) > 0) {
+                addHeaderToResponse(response, "Access-Control-Allow-Headers", allowedHeaders);
+            }
+            addHeaderToResponse(response, "Access-Control-Max-Age", "86400"); // Cache preflight for 24 hours
+            response->status = HTTP_OK;
+            response->content = strdup(""); // No content for preflight
+        }
+    }
+}
+
 void* key_listener(void* arg) {
     (void)arg;
 
@@ -96,6 +177,114 @@ void* key_listener(void* arg) {
     return NULL;
 }
 
+
+void* handleClient(void* arg) {
+    ClientHandlerArgs *clientArgs = (ClientHandlerArgs *)arg;
+    int clientSocket = clientArgs->clientSocket;
+    App *app = clientArgs->app;
+
+    char buffer[BUFFER_SIZE] = {0};
+    ssize_t bytesRead = read(clientSocket, buffer, sizeof(buffer) - 1);
+    if (bytesRead < 0) {
+        perror("read failed");
+        close(clientSocket);
+        free(clientArgs);
+        return NULL;
+    }
+
+    HttpParser parser = parseRequest(buffer);
+    HttpRequest request = parser.request;
+
+    char *pathOnly = strdup(request.resource);
+    char *queryStart = strchr(pathOnly, '?');
+    if (queryStart) {
+        *queryStart = '\0';
+    }
+
+    Route *route = findRoute(app->server.router, request.method, pathOnly);
+    bool routeOfAnyMethodExists = pathExists(app->server.router, pathOnly);
+
+    if (!route && !routeOfAnyMethodExists) {
+        Route *notFoundRoute = findRoute(app->server.router, request.method, "/404");
+
+        if (notFoundRoute) {
+            route = notFoundRoute;
+        }
+    }
+
+    free(pathOnly);
+
+    RequestContext context = requestContext(app, request);
+
+    context.hasBody = parser.isValid && request.bodyLength > 0;
+    context.body = context.hasBody ? jsonParse(request.body) : NULL;
+
+    HttpResponse response = {
+        .content = NULL,
+        .status = HTTP_OK,
+        .contentType = TEXT_PLAIN,
+        .headers = NULL,
+        .headerCount = 0
+    };
+
+    if (route) {
+        app->middleware.current = 0;
+
+        MiddlewareHandler combinedMiddleware = combineMiddleware(&app->middleware, route->middleware);
+        response = next(context, &combinedMiddleware);
+        
+        free(combinedMiddleware.handlers);
+    } else {
+        app->middleware.current = 0;
+        app->middleware.finalHandler = routeOfAnyMethodExists ? defaultMethodNotAllowedController : defaultNotFoundController;
+        response = next(context, &app->middleware);
+    }
+
+    freeJsonBuilder(context.body);
+
+    if (!response.content) {
+        response.content = strdup("");
+    }
+
+    applyCorsHeaders(&app->corsPolicy, &request, &response);
+
+    int contentLength = strlen(response.content);
+
+    const char *statusText = httpStatusCodeToStr(response.status);
+
+    char header[512];
+    snprintf(header, sizeof(header),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n",
+            response.status, statusText, response.contentType, contentLength
+    );
+
+    // Add custom headers
+    for (size_t i = 0; i < response.headerCount; i++) {
+        char headerLine[MAX_HEADER_NAME + MAX_HEADER_VALUE + 4]; // name: value\r\n
+        snprintf(headerLine, sizeof(headerLine), "%s: %s\r\n", response.headers[i].name, response.headers[i].value);
+        strcat(header, headerLine);
+    }
+    strcat(header, "\r\n"); // End of headers
+
+    signal(SIGPIPE, SIG_IGN);
+
+    int err = 0;
+    if ((err = write(clientSocket, header, strlen(header))) == -1) {
+        fprintf(stderr, "write header failed with errno(%d)", err);
+    }
+
+    if ((err = write(clientSocket, response.content, contentLength)) == -1) {
+        perror("write content failed");
+    }
+
+    close(clientSocket);
+    freeHttpResponse(&response);
+    free(clientArgs);
+    return NULL;
+}
 
 void runServer(App *app) {
     if (!app) return;
@@ -177,97 +366,27 @@ void runServer(App *app) {
             }
         }
 
-        char buffer[BUFFER_SIZE] = {0}; // oops
-        ssize_t bytesRead = read(clientSocket, buffer, sizeof(buffer) - 1);
-        if (bytesRead < 0) {
-            perror("read failed");
+        ClientHandlerArgs *clientArgs = malloc(sizeof(ClientHandlerArgs));
+        if (!clientArgs) {
+            fprintf(stderr, "Fatal: out of memory\n");
             close(clientSocket);
             continue;
         }
+        clientArgs->clientSocket = clientSocket;
+        clientArgs->app = app;
 
-        HttpParser parser = parseRequest(buffer);
-        HttpRequest request = parser.request;
-
-        char *pathOnly = strdup(request.resource);
-        char *queryStart = strchr(pathOnly, '?');
-        if (queryStart) {
-            *queryStart = '\0';
+        pthread_t clientThread;
+        if (pthread_create(&clientThread, NULL, handleClient, (void *)clientArgs) != 0) {
+            perror("Failed to create client thread");
+            close(clientSocket);
+            free(clientArgs);
+            continue;
         }
-
-        Route *route = findRoute(app->server.router, request.method, pathOnly);
-        bool routeOfAnyMethodExists = pathExists(app->server.router, pathOnly);
-
-        if (!route && !routeOfAnyMethodExists) {
-            Route *notFoundRoute = findRoute(app->server.router, request.method, "/404");
-
-            if (notFoundRoute) {
-                route = notFoundRoute;
-            }
-        }
-
-        free(pathOnly);
-
-        RequestContext context = requestContext(app, request);
-
-        context.hasBody = parser.isValid && request.bodyLength > 0;
-        context.body = context.hasBody ? jsonParse(request.body) : NULL;
-
-        HttpResponse response;
-        if (route) {
-            app->middleware.current = 0;
-
-            MiddlewareHandler combinedMiddleware = combineMiddleware(&app->middleware, route->middleware);
-            response = next(context, &combinedMiddleware);
-            
-            free(combinedMiddleware.handlers);
-        } else {
-            app->middleware.current = 0;
-            app->middleware.finalHandler = routeOfAnyMethodExists ? defaultMethodNotAllowedController : defaultNotFoundController;
-            response = next(context, &app->middleware);
-        }
-
-        freeJsonBuilder(context.body);
-
-        if (!response.content) {
-            response.content = strdup("");
-        }
-
-        int contentLength = strlen(response.content);
-
-        const char *statusText = httpStatusCodeToStr(response.status);
-
-        char header[512];
-        snprintf(header, sizeof(header),
-                "HTTP/1.1 %d %s\r\n"
-                "Content-Type: %s\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                response.status, statusText, response.contentType, contentLength
-        );
-
-        signal(SIGPIPE, SIG_IGN);
-
-        int err = 0;
-        if(app->server.writingThreads == 0) {
-          app->server.writingThreads++;
-          if ((err = write(clientSocket, header, strlen(header))) == -1) {
-              fprintf(stderr, "write header failed with errno(%d)", err);
-          }
-
-          if ((err = write(clientSocket, response.content, contentLength)) == -1) {
-              perror("write content failed");
-          }
-        app->server.writingThreads--;
-        }
-
-        close(clientSocket);
+        pthread_detach(clientThread);
     }
 
 
-     if(app->server.writingThreads == 0)
-      freeServer(&app->server);
-    pthread_join(thread_id, NULL);
+     pthread_join(thread_id, NULL);
 
     if (serverState == STATE_RESTARTING) {
         int result = system("make -s");
